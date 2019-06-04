@@ -1,4 +1,4 @@
-D-STASH - A simple high performance, resilient, distributed key/value store.
+# D-STASH - A simple high performance, resilient, distributed key/value store.
   
 ## Overview
 

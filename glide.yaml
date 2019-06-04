@@ -1,0 +1,26 @@
+package: github.com/guymolinari/dstash
+import:
+- package: github.com/akrylysov/pogreb
+- package: github.com/aviddiviner/go-murmur
+- package: github.com/bbalet/stopwords
+- package: github.com/golang/protobuf
+  subpackages:
+  - proto
+  - ptypes/empty
+  - ptypes/wrappers
+- package: github.com/hashicorp/consul
+  subpackages:
+  - api
+- package: github.com/steakknife/bloomfilter
+- package: github.com/stvp/rendezvous
+- package: golang.org/x/text
+  subpackages:
+  - unicode/norm
+- package: google.golang.org/grpc
+  subpackages:
+  - codes
+  - credentials
+  - health/grpc_health_v1
+  - status
+  - testdata
+- package: gopkg.in/alecthomas/kingpin.v2

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "io.grpc.guymolinari.dstash";
+option java_outer_classname = "DStashProto";
+
+package dstash;
+import "google/protobuf/empty.proto";
+import "google/protobuf/wrappers.proto";
+
+service DStash {
+  rpc Put(KVPair) returns (google.protobuf.Empty) {}
+  rpc BatchPut(stream KVPair) returns (google.protobuf.Empty) {}
+  rpc Lookup(KVPair) returns (KVPair) {}
+  rpc BatchLookup(stream KVPair) returns (stream KVPair) {}
+  rpc Items(google.protobuf.Empty) returns (stream KVPair) {}
+  rpc Status(google.protobuf.Empty) returns (StatusMessage) {}
+ 
+  rpc BatchIndex(stream google.protobuf.StringValue) returns (google.protobuf.Empty) {}
+  rpc Search(google.protobuf.StringValue) returns (stream google.protobuf.UInt64Value) {}
+}
+
+message Success {
+  bool ok = 1;
+}
+
+message StatusMessage {
+  string status = 1;
+}
+
+message KVPair {
+  bytes  key = 1;
+  bytes  value = 2;
+}

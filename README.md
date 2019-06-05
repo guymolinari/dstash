@@ -57,6 +57,8 @@ Pull requests are always welcome.
 
 - Unit and integration tests sorely needed (this is a great way to get started as a contributor!)
 - Examples/sample code/applications.
+- Needs Makefile/build script for binary.
+- Remove glide dependency in favor of Go Modules.
 - Implement "scale in" with zero downtime on a running cluster.  Failover replication is already implemented but we need a "planned" way to reduce cluster size.
 - Conversely we need to also "scale out" cluster size without downtime.
 - Detailed performance benchmarks.

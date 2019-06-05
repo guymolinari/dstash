@@ -41,7 +41,7 @@ It does offer a few advantages that DStash does not:
 
 Adding network serialization on top of Pogreb is sure to introduce latency.  Pogreb manages this by utilizing the streaming API constructs of Grpc.  API interfaces such as **Put()** and **Lookup()** also have batch equivalents that mitigates this when taken in aggregate.   So, a batch lookup of say 100,000 items can be performed in a few hundred milliseconds on contemporary hardware.  The same holds true for batch put operations.  
 
-When DStash is deployed in the cloud, low cost server nodes allow for high levels of scalability.  The DStash client is optimized to use parallism where ever possible.  DStash is architected to be deployed on an orchestrated platform such as Kubernetes to maximize administrative/operational scale.
+When DStash is deployed in the cloud, low cost server nodes allow for high levels of scalability.  The DStash client is optimized to use parallelism where ever possible.  DStash is architected to be deployed on an orchestrated platform such as Kubernetes to maximize administrative/operational scale.
 
 //TODO:  Add performance metrics
 

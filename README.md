@@ -4,7 +4,7 @@
 
 DStash is a [GoLang](https://golang.org/) library and binary that implements a distributed hashtable that is persistent.  It utilizes a masterless architecture to achieve high availability and fault tolerance in support of applications that require high uptime SLAs. 
 
-DStash builds upon the excellent open source library [Pogreb](https://github.com/akrylysov/pogreb).  Pogreb was designed to be deployed "in-process" with it's consuming application.  It's interface is similar to Go's *map* data structure.  Persistence is implemented via *mmap* and its data set can be larger than available memory.  It is also designed to use relatively small memory footprint.
+DStash builds upon the excellent open source library [Pogreb](https://github.com/akrylysov/pogreb).  Pogreb was designed to be deployed "in-process" with its consuming application.  Its interface is similar to Go's *map* data structure.  Persistence is implemented via *mmap* and its data set can be larger than available memory.  It is also designed to use relatively small memory footprint.
 
 In addition to Pogreb, DStash leverages the following OSS projects:
 
@@ -56,6 +56,7 @@ Pull requests are always welcome.
 ## Roadmap
 
 - Unit and integration tests sorely needed (this is a great way to get started as a contributor!)
+- Examples/sample code/applications.
 - Implement "scale in" with zero downtime on a running cluster.  Failover replication is already implemented but we need a "planned" way to reduce cluster size.
 - Conversely we need to also "scale out" cluster size without downtime.
 - Detailed performance benchmarks.
@@ -63,6 +64,7 @@ Pull requests are always welcome.
 - Dockerfile and entrypoint scripts.
 - Remove dependency on Consul (native Kubernetes services?)
 - Multi AZ/data center support.
+- TTL based key expiration.
 - Support for custom types.
 
 

@@ -18,6 +18,7 @@ service DStash {
  
   rpc BatchIndex(stream google.protobuf.StringValue) returns (google.protobuf.Empty) {}
   rpc Search(google.protobuf.StringValue) returns (stream google.protobuf.UInt64Value) {}
+  rpc BatchSetBit(stream IndexKVPair) returns (google.protobuf.Empty) {}
 }
 
 message Success {
@@ -26,6 +27,12 @@ message Success {
 
 message StatusMessage {
   string status = 1;
+}
+
+message IndexKVPair {
+  string indexPath = 1;
+  bytes  key = 2;
+  bytes  value = 3;
 }
 
 message KVPair {

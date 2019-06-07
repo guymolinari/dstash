@@ -12,7 +12,7 @@ import (
     "net"
     "path"
     "regexp"
-    _ "sync"
+    "sync"
     "golang.org/x/text/unicode/norm"
     "github.com/steakknife/bloomfilter"
     "github.com/aviddiviner/go-murmur"
@@ -43,9 +43,12 @@ type EndPoint struct {
     tls           bool
     certFile      string
     keyFile       string
+	dataDir		  string
     store         *pogreb.DB
     searchIndex   *pogreb.DB
     hashKey       string
+	storeCache	  map[string]*pogreb.DB
+	storeLock	  sync.RWMutex
 }
 
 
@@ -64,7 +67,33 @@ func NewEndPoint(dataDir string) (*EndPoint, error) {
         return nil, fmt.Errorf("Data dir must not be root.")
 	}
 
+	m.storeCache = make(map[string]*pogreb.DB)
+	m.dataDir = dataDir
+
     return m, nil
+}
+
+
+func (m *EndPoint) getStoreHandle(dataDir, indexPath string) (*pogreb.DB, error) {
+
+    path := dataDir + "/" + indexPath
+	if db, ok := m.storeCache[path]; ok {
+		return db, nil
+	}
+    db, err := pogreb.Open(path, nil)
+    if err != nil {
+        return nil, err
+    }
+	m.storeCache[path] = db
+	return db, nil
+}
+
+
+func (m *EndPoint) syncStores()  {
+	
+	for _, db := range m.storeCache {
+		db.Sync()
+	}
 }
 
 
@@ -333,6 +362,34 @@ func constructBloomFilter(content string) (*bloomfilter.Filter, error) {
 }
         
 
+func (m *EndPoint) BatchSetBit(stream pb.DStash_BatchSetBitServer) error {
+
+    var putCount int32
+    for {
+        kv, err := stream.Recv()
+        if err == io.EOF {
+            m.syncStores()
+            return stream.SendAndClose(&empty.Empty{})
+        }
+        if err != nil {
+            return err
+        }
+        putCount++
+	    if kv == nil {
+			return fmt.Errorf("KV Pair must not be nil")
+		}
+	    if kv.Key == nil || len(kv.Key) == 0 {
+			return fmt.Errorf("Key must be specified.")
+		}
+		store, err := m.getStoreHandle(m.dataDir, kv.IndexPath)
+        if err != nil {
+            return err
+        }
+		if err := store.Put(kv.Key, kv.Value); err != nil {
+    		return err
+		}
+    }
+}
 
 type HealthImpl struct{}
 

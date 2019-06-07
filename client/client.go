@@ -17,6 +17,7 @@ import (
     "github.com/golang/protobuf/ptypes/empty"
     "github.com/golang/protobuf/ptypes/wrappers"
     pb "github.com/guymolinari/dstash/grpc"
+	"github.com/RoaringBitmap/roaring"
 )
 
 var (
@@ -46,12 +47,15 @@ type Client struct {
 	indexBatch           map[string]struct{}
     batchSize            int
     indexMutex           sync.Mutex
+    bitBatch		 	 map[string]map[string]map[uint64]*roaring.Bitmap
+    bitBatchSize         int
+    bitBatchMutex        sync.Mutex
 }
 
 
 func NewDefaultClient() *Client {
     m := &Client{}
-	m.ServiceName = "keymaster"
+	m.ServiceName = "dstash"
     m.ServicePort = 5000
     m.ServerHostOverride = "x.test.youtube.com"
     m.pollWait = time.Second
@@ -593,6 +597,130 @@ func (c *Client) search(client pb.DStashClient, searchTerms string) (map[uint64]
     }
 
     return batch, nil
+}
+
+
+func (c *Client) SetBit(index, field string, tupleID uint64, bitPos uint64) error {
+
+    c.bitBatchMutex.Lock()
+    defer c.bitBatchMutex.Unlock()
+
+	if c.bitBatch == nil {
+		c.bitBatch = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+	}
+	if _, ok := c.bitBatch[index]; !ok {
+		c.bitBatch[index] = make(map[string]map[uint64]*roaring.Bitmap)
+	}
+	if _, ok := c.bitBatch[index][field]; !ok {
+		c.bitBatch[index][field] = make(map[uint64]*roaring.Bitmap)
+	}
+	b := roaring.BitmapOf(uint32(bitPos))
+	c.bitBatch[index][field][tupleID] = b
+
+    if len(c.bitBatch) >= c.bitBatchSize {
+        if err := c.BatchSetBit(c.bitBatch); err != nil {
+            return err
+        }
+        c.bitBatch = nil
+    }
+	return nil
+}
+
+
+
+
+func (c *Client) BatchSetBit(batch map[string]map[string]map[uint64]*roaring.Bitmap) error {
+
+    batches := c.splitBitmapBatch(batch, c.Replicas)
+
+    done := make(chan error)
+    defer close(done)
+    count := len(batches)
+    for i, v := range batches {
+        go func(client pb.DStashClient, m map[string]map[string]map[uint64]*roaring.Bitmap) {
+			done <- c.batchSetBit(client, m)
+		}(c.client[i], v)
+	}
+	for {
+		err := <- done
+		if err != nil {
+			return err
+		}
+		count--
+		if count == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+
+func (c *Client) batchSetBit(client pb.DStashClient, batch map[string]map[string]map[uint64]*roaring.Bitmap) error {
+
+    ctx, cancel := context.WithTimeout(context.Background(), Deadline * time.Second)
+    defer cancel()
+    b := make([]*pb.IndexKVPair, len(batch))
+    i := 0
+   	for indexName, index := range batch {
+        for fieldName, field := range index {
+            for tupleID, bitmap := range field {
+				buf, err := bitmap.ToBytes()
+				if err != nil {
+					return err
+				}
+				b[i] = &pb.IndexKVPair{IndexPath: indexName + "/" + fieldName, Key: ToBytes(tupleID), Value: buf}
+				i++
+			}
+		}
+    }
+    stream, err := client.BatchSetBit(ctx)
+    if err != nil {
+        return fmt.Errorf("%v.BatchSetBit(_) = _, %v: ", c.client, err)
+    }
+
+	for i := 0; i < len(b); i++ {
+        if err := stream.Send(b[i]); err != nil {
+            return fmt.Errorf("%v.Send(%v) = %v", stream, b[i], err)
+        }
+	}
+    _, err2 := stream.CloseAndRecv()
+    if err2 != nil {
+        return fmt.Errorf("%v.CloseAndRecv() got error %v, want %v", stream, err2, nil)
+    }
+    return nil
+}
+
+
+func (c *Client) splitBitmapBatch(batch map[string]map[string]map[uint64]*roaring.Bitmap, 
+		replicas int) []map[string]map[string]map[uint64]*roaring.Bitmap {
+
+    batches := make([]map[string]map[string]map[uint64]*roaring.Bitmap, len(c.client))
+    for i, _ := range batches {
+        batches[i] = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+    }
+
+	for indexName, index := range batch {
+		for fieldName, field := range index {
+			for tupleID, bitmap := range field {
+				nodeKeys := c.hashTable.GetN(replicas, fmt.Sprintf("%d", tupleID))
+				for _, nodeKey := range nodeKeys {
+					if i, ok := c.nodeMap[nodeKey]; ok {
+						if batches[i] == nil {
+							batches[i] = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+						}
+						if _, ok := batches[i][indexName]; !ok {
+							batches[i][indexName] = make(map[string]map[uint64]*roaring.Bitmap)
+						}
+						if _, ok := batches[i][indexName][fieldName]; !ok {
+							c.bitBatch[indexName][fieldName] = make(map[uint64]*roaring.Bitmap)
+						}
+						batches[i][indexName][fieldName][tupleID] = bitmap
+					}
+				}
+			}
+		}
+	}
+	return batches
 }
 
 

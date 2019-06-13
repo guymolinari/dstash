@@ -44,12 +44,15 @@ type Client struct {
     pollWait             time.Duration
     nodes                []*api.ServiceEntry
     nodeMap              map[string]int
+	nodeMapLock			 sync.RWMutex
 	indexBatch           map[string]struct{}
     batchSize            int
     indexMutex           sync.Mutex
     bitBatch		 	 map[string]map[string]map[uint64]*roaring.Bitmap
     bitBatchSize         int
+    bitBatchCount        int
     bitBatchMutex        sync.Mutex
+	bitBatchDuration	 float64
 }
 
 
@@ -58,10 +61,11 @@ func NewDefaultClient() *Client {
 	m.ServiceName = "dstash"
     m.ServicePort = 5000
     m.ServerHostOverride = "x.test.youtube.com"
-    m.pollWait = time.Second
+    m.pollWait = time.Second * 5
     m.Quorum = 1
 	m.Replicas = 1
     m.batchSize = 1000
+	m.bitBatchSize = 1000000
     return m
 }
 
@@ -121,6 +125,9 @@ func (m *Client) Connect() (err error) {
 
 func (c *Client) selectNodes(key interface{}) []pb.DStashClient {
 
+	c.nodeMapLock.RLock()
+	defer c.nodeMapLock.RUnlock()
+
     nodeKeys := c.hashTable.GetN(c.Replicas, ToString(key))
     selected := make([]pb.DStashClient, len(nodeKeys))
 	
@@ -144,6 +151,13 @@ func (c *Client) Disconnect() error {
 			return err
 		}
 		c.indexBatch = nil
+    }
+
+    if c.bitBatch != nil {
+		if err := c.BatchSetBit(c.bitBatch); err != nil {
+			return err
+		}
+		c.bitBatch = nil
     }
 
 	for i := 0; i < len(c.clientConn); i++ {
@@ -191,6 +205,9 @@ func (c *Client) Put(k interface{}, v interface{}) error {
 
 func (c *Client) splitBatch(batch map[interface{}]interface{}, replicas int) []map[interface{}]interface{} {
 
+	c.nodeMapLock.RLock()
+	defer c.nodeMapLock.RUnlock()
+
     batches := make([]map[interface{}]interface{}, len(c.client))
     for i, _ := range batches {
         batches[i] = make(map[interface{}]interface{}, 0)
@@ -214,6 +231,9 @@ func (c *Client) splitBatch(batch map[interface{}]interface{}, replicas int) []m
 
 
 func (c *Client) splitStringBatch(batch map[string]struct{}, replicas int) []map[string]struct{} {
+
+	c.nodeMapLock.RLock()
+	defer c.nodeMapLock.RUnlock()
 
     batches := make([]map[string]struct{}, len(c.client))
     for i, _ := range batches {
@@ -600,7 +620,7 @@ func (c *Client) search(client pb.DStashClient, searchTerms string) (map[uint64]
 }
 
 
-func (c *Client) SetBit(index, field string, tupleID uint64, bitPos uint64) error {
+func (c *Client) SetBit(index, field string, columnID, rowID uint64, ts time.Time) error {
 
     c.bitBatchMutex.Lock()
     defer c.bitBatchMutex.Unlock()
@@ -614,19 +634,30 @@ func (c *Client) SetBit(index, field string, tupleID uint64, bitPos uint64) erro
 	if _, ok := c.bitBatch[index][field]; !ok {
 		c.bitBatch[index][field] = make(map[uint64]*roaring.Bitmap)
 	}
-	b := roaring.BitmapOf(uint32(bitPos))
-	c.bitBatch[index][field][tupleID] = b
+    if bmap, ok := c.bitBatch[index][field][rowID]; !ok {
+		b := roaring.BitmapOf(uint32(columnID))
+		c.bitBatch[index][field][rowID] = b
+	} else {
+		bmap.Add(uint32(columnID))
+	}
 
-    if len(c.bitBatch) >= c.bitBatchSize {
+    c.bitBatchCount++
+
+    //c.bitBatchDuration = c.bitBatchDuration + elapsed.Seconds()
+    if c.bitBatchCount >= c.bitBatchSize {
+		//start := time.Now()
         if err := c.BatchSetBit(c.bitBatch); err != nil {
             return err
         }
+    	//elapsed := time.Since(start)
+		//log.Printf("BatchBitSet duration %v\n", elapsed)
+		//log.Printf("Batch create duration %v.\n", (c.bitBatchDuration / float64(c.bitBatchCount) * float64(1000000)))
         c.bitBatch = nil
+		c.bitBatchCount = 0
+		//c.bitBatchDuration = float64(0)
     }
 	return nil
 }
-
-
 
 
 func (c *Client) BatchSetBit(batch map[string]map[string]map[uint64]*roaring.Bitmap) error {
@@ -659,32 +690,37 @@ func (c *Client) batchSetBit(client pb.DStashClient, batch map[string]map[string
 
     ctx, cancel := context.WithTimeout(context.Background(), Deadline * time.Second)
     defer cancel()
-    b := make([]*pb.IndexKVPair, len(batch))
+    b := make([]*pb.IndexKVPair, 0)
     i := 0
    	for indexName, index := range batch {
         for fieldName, field := range index {
-            for tupleID, bitmap := range field {
+            for rowID, bitmap := range field {
 				buf, err := bitmap.ToBytes()
 				if err != nil {
+        			log.Printf("bitmap.ToBytes: %v", err)
 					return err
 				}
-				b[i] = &pb.IndexKVPair{IndexPath: indexName + "/" + fieldName, Key: ToBytes(tupleID), Value: buf}
+				b = append(b, &pb.IndexKVPair{IndexPath: indexName + "/" + fieldName, Key: ToBytes(rowID), Value: buf})
 				i++
+				//log.Printf("Sent batch %d for path %s\n", i, b[i].IndexPath)
 			}
 		}
     }
     stream, err := client.BatchSetBit(ctx)
     if err != nil {
+        log.Printf("%v.BatchSetBit(_) = _, %v: ", c.client, err)
         return fmt.Errorf("%v.BatchSetBit(_) = _, %v: ", c.client, err)
     }
 
 	for i := 0; i < len(b); i++ {
         if err := stream.Send(b[i]); err != nil {
+            log.Printf("%v.Send(%v) = %v", stream, b[i], err)
             return fmt.Errorf("%v.Send(%v) = %v", stream, b[i], err)
         }
 	}
     _, err2 := stream.CloseAndRecv()
     if err2 != nil {
+        log.Printf("%v.CloseAndRecv() got error %v, want %v", stream, err2, nil)
         return fmt.Errorf("%v.CloseAndRecv() got error %v, want %v", stream, err2, nil)
     }
     return nil
@@ -694,6 +730,9 @@ func (c *Client) batchSetBit(client pb.DStashClient, batch map[string]map[string
 func (c *Client) splitBitmapBatch(batch map[string]map[string]map[uint64]*roaring.Bitmap, 
 		replicas int) []map[string]map[string]map[uint64]*roaring.Bitmap {
 
+	c.nodeMapLock.RLock()
+	defer c.nodeMapLock.RUnlock()
+
     batches := make([]map[string]map[string]map[uint64]*roaring.Bitmap, len(c.client))
     for i, _ := range batches {
         batches[i] = make(map[string]map[string]map[uint64]*roaring.Bitmap)
@@ -701,8 +740,8 @@ func (c *Client) splitBitmapBatch(batch map[string]map[string]map[uint64]*roarin
 
 	for indexName, index := range batch {
 		for fieldName, field := range index {
-			for tupleID, bitmap := range field {
-				nodeKeys := c.hashTable.GetN(replicas, fmt.Sprintf("%d", tupleID))
+			for rowID, bitmap := range field {
+				nodeKeys := c.hashTable.GetN(replicas, fmt.Sprintf("%s/%s/%d", indexName, fieldName, rowID))
 				for _, nodeKey := range nodeKeys {
 					if i, ok := c.nodeMap[nodeKey]; ok {
 						if batches[i] == nil {
@@ -712,9 +751,9 @@ func (c *Client) splitBitmapBatch(batch map[string]map[string]map[uint64]*roarin
 							batches[i][indexName] = make(map[string]map[uint64]*roaring.Bitmap)
 						}
 						if _, ok := batches[i][indexName][fieldName]; !ok {
-							c.bitBatch[indexName][fieldName] = make(map[uint64]*roaring.Bitmap)
+							batches[i][indexName][fieldName] = make(map[uint64]*roaring.Bitmap)
 						}
-						batches[i][indexName][fieldName][tupleID] = bitmap
+						batches[i][indexName][fieldName][rowID] = bitmap
 					}
 				}
 			}
@@ -748,6 +787,8 @@ func (c *Client) poll() {
 // update blocks until the service list changes or until the Consul agent's
 // timeout is reached (10 minutes by default).
 func (c *Client) update() (err error) {
+
+
 	opts := &api.QueryOptions{WaitIndex: c.waitIndex}
 	serviceEntries, meta, err := c.consul.Health().Service(c.ServiceName, "", true, opts)
 	if err != nil {
@@ -756,6 +797,9 @@ func (c *Client) update() (err error) {
     if serviceEntries == nil {
 		return nil
 	}
+
+	c.nodeMapLock.Lock()
+	defer c.nodeMapLock.Unlock()
 
     c.nodes = serviceEntries
     c.nodeMap = make(map[string]int, len(serviceEntries))

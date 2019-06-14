@@ -62,6 +62,9 @@ type EndPoint struct {
 	fragQueue	  chan *BitmapFragment
 	workers		  int
 	fragFileLock  sync.Mutex
+	setBitThreads *CountTrigger
+	writeSignal   chan bool
+	
 }
 
 
@@ -86,6 +89,8 @@ func NewEndPoint(dataDir string) (*EndPoint, error) {
 
 	m.bitmapCache = make(map[string]map[string]map[uint64]*StandardBitmap)
 	m.workers = 3
+	m.writeSignal = make(chan bool, 1)
+	m.setBitThreads = NewCountTrigger(m.writeSignal)
 
     return m, nil
 }
@@ -119,6 +124,9 @@ func (m *EndPoint) Start() error {
 		go m.batchLoadProcessLoop(i + 1)
 	}
 	go m.overflowProcessLoop()
+
+    // Read files from disk
+	m.readBitmapFiles(m.fragQueue, true)
 
     grpcServer.Serve(lis)
     return nil
@@ -364,7 +372,9 @@ func constructBloomFilter(content string) (*bloomfilter.Filter, error) {
 
 func (m *EndPoint) BatchSetBit(stream pb.DStash_BatchSetBitServer) error {
 
-    var putCount int32
+	m.setBitThreads.Add(1)
+	defer m.setBitThreads.Add(-1)
+
     for {
         kv, err := stream.Recv()
         if err == io.EOF {
@@ -373,7 +383,6 @@ func (m *EndPoint) BatchSetBit(stream pb.DStash_BatchSetBitServer) error {
         if err != nil {
             return err
         }
-        putCount++
 	    if kv == nil {
 			return fmt.Errorf("KV Pair must not be nil")
 		}
@@ -423,14 +432,14 @@ func (m *EndPoint) journalBitmapFragment(newBm []byte, indexName, fieldName stri
 }
 
 
-func (m *EndPoint) saveCompleteBitmap(bm *StandardBitmap, indexName, fieldName string, rowID uint64) error {
+func (m *EndPoint) saveCompleteBitmap(bm *StandardBitmap, indexName, fieldName string, rowID uint64, create bool) error {
 
 	data, err := bm.Bits.MarshalBinary() 
 	if err != nil {
 		return err
 	}
 
-	if fd, err := m.newCompleteFile(indexName, fieldName, rowID); err == nil {
+	if fd, err := m.writeCompleteFile(indexName, fieldName, rowID, create); err == nil {
 		if _, err := fd.Write(data); err != nil {
 			return err
 		}
@@ -470,17 +479,44 @@ func newBitmapFragment(index, field string, rowID uint64, f []byte) *BitmapFragm
 }
 
 
-func (m *EndPoint) newCompleteFile(index, field string, rowID uint64) (*os.File, error) {
+func (m *EndPoint) shouldWriteFile(index, field string, rowID uint64, mod time.Time) (create bool, update bool){
 
 	baseDir := m.dataDir + SEP + "bitmap" + SEP + index + SEP + field
     os.MkdirAll(baseDir, 0755)
 	fname := fmt.Sprintf("%d", rowID)
     path := baseDir + SEP + fname
-	f, err := os.OpenFile(path, os.O_CREATE | os.O_WRONLY, 0666)
+   	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		create = true
+		return
 	}
-	return f, nil
+	if mod.After(info.ModTime()) {
+		update = true
+		return
+	}
+	return
+}
+
+
+func (m *EndPoint) writeCompleteFile(index, field string, rowID uint64, create bool) (*os.File, error) {
+
+	baseDir := m.dataDir + SEP + "bitmap" + SEP + index + SEP + field
+    os.MkdirAll(baseDir, 0755)
+	fname := fmt.Sprintf("%d", rowID)
+    path := baseDir + SEP + fname
+	if create {
+		f, err := os.OpenFile(path, os.O_CREATE | os.O_WRONLY, 0666)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	} else {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0666)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
 }
 
 
@@ -508,7 +544,7 @@ func (m *EndPoint) readBitmapFiles(fragQueue chan *BitmapFragment, isComplete bo
 
 	var subPath string
     if isComplete {
-		subPath = "complete"
+		subPath = "bitmap"
 	} else {
 		subPath = "overflow"
 	}
@@ -595,7 +631,14 @@ func (m *EndPoint) batchLoadProcessLoop(threadID int) {
 		select {
 		case frag := <- m.fragQueue:
 			m.updateBitmapCache(frag)
+			continue
 		default:
+		}
+		select {
+		case frag := <- m.fragQueue:
+			m.updateBitmapCache(frag)
+			continue
+		case <- m.writeSignal:
 			m.checkPersistBitmapCache()
 		}
 	}
@@ -662,13 +705,16 @@ func (m *EndPoint) checkPersistBitmapCache() {
 				if dur, _ := time.ParseDuration("5s"); lastModSecs >= dur {
 					bitmap.Lock.Lock()
    					start := time.Now()
-					if err := m.saveCompleteBitmap(bitmap, indexName, fieldName, rowID); err != nil {
-						log.Printf("saveCompleteBitmap failed! - %v", err)
-						bitmap.Lock.Unlock()
-						return
+					if create, update := m.shouldWriteFile(indexName, fieldName, rowID, bitmap.ModTime); create || update {
+						if err := m.saveCompleteBitmap(bitmap, indexName, fieldName, rowID, create); err != nil {
+							log.Printf("saveCompleteBitmap failed! - %v", err)
+							bitmap.Lock.Unlock()
+							return
+						}
+	    				elapsed := time.Since(start)
+	    				log.Printf("Persist [%s/%s/%d] done in %v. Last mod %v seconds ago.", indexName, 
+							fieldName, rowID,  elapsed, lastModSecs)
 					}
-    				elapsed := time.Since(start)
-    				log.Printf("Persist [%s/%s/%d] done in %v.\n", indexName, fieldName, rowID,  elapsed)
 					bitmap.Lock.Unlock()
 				}
 			}
@@ -676,6 +722,31 @@ func (m *EndPoint) checkPersistBitmapCache() {
 	}
 }
 
+
+
+// Send message when counter reaches zero
+type CountTrigger struct {
+	num  int
+	lock sync.Mutex
+	trigger chan bool
+}
+
+func NewCountTrigger(t chan bool) *CountTrigger {
+	return &CountTrigger{trigger: t}
+}
+
+/*
+ * Add function provides thread safe addition of counter value based on input parameter.
+ * If counter falls to zero then a value will be sent to trigger channel.
+ */
+func (c *CountTrigger) Add(n int) {
+	c.lock.Lock()
+	c.num += n
+	if c.num == 0 {
+		c.trigger <- true
+	}
+	c.lock.Unlock()
+}
 
 
 type HealthImpl struct{}

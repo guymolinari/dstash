@@ -103,6 +103,8 @@ func (m *EndPoint) Start() error {
         return fmt.Errorf("failed to listen: %v", err)
     }
     var opts []grpc.ServerOption
+	opts = append(opts, grpc.MaxRecvMsgSize(1024*1024*20), grpc.MaxSendMsgSize(1024*1024*20))
+
     if m.tls {
         if m.certFile == "" {
             m.certFile = testdata.Path("server1.pem")
@@ -461,7 +463,7 @@ type StandardBitmap struct {
 
 
 func newStandardBitmap() *StandardBitmap {
-	return &StandardBitmap{Bits: roaring.NewBitmap(), ModTime: time.Now()}
+	return &StandardBitmap{Bits: roaring.NewBitmap(), ModTime: time.Now().Add(time.Second * 10)}
 }
 
 
@@ -681,10 +683,10 @@ func (m *EndPoint) updateBitmapCache(f *BitmapFragment) {
 		m.bitmapCacheLock.Unlock()
 	} else {
 		m.bitmapCacheLock.Unlock()
-		newBm.Lock.Lock()
-        newBm.Bits = roaring.ParOr(0, existBm.Bits, newBm.Bits)
-		newBm.ModTime = time.Now()
-		newBm.Lock.Unlock()
+		existBm.Lock.Lock()
+        existBm.Bits = roaring.ParOr(0, existBm.Bits, newBm.Bits)
+		existBm.ModTime = time.Now()
+		existBm.Lock.Unlock()
 	}
     elapsed := time.Since(start)
 	if elapsed.Nanoseconds() > 10000000 {
@@ -702,7 +704,7 @@ func (m *EndPoint) checkPersistBitmapCache() {
         for fieldName, field := range index {
             for rowID, bitmap := range field {
 				lastModSecs := time.Since(bitmap.ModTime).Round(time.Second)
-				if dur, _ := time.ParseDuration("5s"); lastModSecs >= dur {
+				if dur, _ := time.ParseDuration("60s"); lastModSecs >= dur {
 					bitmap.Lock.Lock()
    					start := time.Now()
 					if create, update := m.shouldWriteFile(indexName, fieldName, rowID, bitmap.ModTime); create || update {
@@ -713,7 +715,7 @@ func (m *EndPoint) checkPersistBitmapCache() {
 						}
 	    				elapsed := time.Since(start)
 	    				log.Printf("Persist [%s/%s/%d] done in %v. Last mod %v seconds ago.", indexName, 
-							fieldName, rowID,  elapsed, lastModSecs)
+						 	fieldName, rowID,  elapsed, lastModSecs)
 					}
 					bitmap.Lock.Unlock()
 				}
@@ -722,6 +724,59 @@ func (m *EndPoint) checkPersistBitmapCache() {
 	}
 }
 
+
+func (m *EndPoint) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappers.BytesValue, error) {
+
+    if query == nil {
+		return &wrappers.BytesValue{}, fmt.Errorf("query must not be nil")
+	}
+	
+    if query.Query == nil {
+		return &wrappers.BytesValue{}, fmt.Errorf("query fragment array must not be nil")
+	}
+    if len(query.Query) == 0 {
+		return &wrappers.BytesValue{}, fmt.Errorf("query fragment array must not be empty")
+	}
+	prevOp := pb.QueryFragment_INTERSECT
+	firstTime := true
+	result := roaring.NewBitmap()
+	for _, v := range query.Query {
+		if v.Index == "" {
+			return nil, fmt.Errorf("Index not specified for query fragment %#v", v)
+		}
+		if v.Field == "" {
+			return nil, fmt.Errorf("Field not specified for query fragment %#v", v)
+		}
+		
+		var bm *StandardBitmap 
+		var ok bool
+		m.bitmapCacheLock.RLock()
+		defer m.bitmapCacheLock.RUnlock()
+		if bm, ok = m.bitmapCache[v.Index][v.Field][v.RowID]; !ok {
+			return &wrappers.BytesValue{Value: []byte("")}, 
+				fmt.Errorf("Cannot find value for [%s/%s/%d]", v.Index, v.Field, v.RowID)
+		}
+		if firstTime  {
+			prevOp = v.Operation
+			result = bm.Bits
+			firstTime = false
+			continue
+		}
+		if prevOp == pb.QueryFragment_INTERSECT {
+			result = roaring.ParAnd(0, result, bm.Bits)
+		} else {
+			result = roaring.ParOr(0, result, bm.Bits)
+		}
+		prevOp = v.Operation
+	}
+
+	if buf, err := result.MarshalBinary(); err != nil {
+		return &wrappers.BytesValue{Value: []byte("")}, 
+			fmt.Errorf("Cannot marshal result roaring bitmap - %v", err)
+	} else {
+		return &wrappers.BytesValue{Value: buf}, nil
+	}
+}
 
 
 // Send message when counter reaches zero

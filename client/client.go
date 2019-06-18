@@ -22,7 +22,7 @@ import (
 
 var (
     //Deadline int = 60
-    Deadline time.Duration = time.Duration(60)
+    Deadline time.Duration = time.Duration(500)
 )
 
 type Client struct {
@@ -65,7 +65,7 @@ func NewDefaultClient() *Client {
     m.Quorum = 1
 	m.Replicas = 1
     m.batchSize = 1000
-	m.bitBatchSize = 1000000
+	m.bitBatchSize = 2000000
     return m
 }
 
@@ -93,9 +93,12 @@ func (m *Client) Connect() (err error) {
 
     m.client = make([]pb.DStashClient, len(m.nodes))
     m.clientConn = make([]*grpc.ClientConn, len(m.nodes))
+	maxMsgSize := 1024*1024*20
    
 	for i := 0; i < len(m.nodes); i++ {
 	    var opts []grpc.DialOption
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize), 
+			grpc.MaxCallSendMsgSize(maxMsgSize)))
 	    if m.tls {
 	        if m.certFile == "" {
 	            m.certFile = testdata.Path("ca.pem")
@@ -645,6 +648,7 @@ func (c *Client) SetBit(index, field string, columnID, rowID uint64, ts time.Tim
 
     //c.bitBatchDuration = c.bitBatchDuration + elapsed.Seconds()
     if c.bitBatchCount >= c.bitBatchSize {
+
 		//start := time.Now()
         if err := c.BatchSetBit(c.bitBatch); err != nil {
             return err
@@ -760,6 +764,84 @@ func (c *Client) splitBitmapBatch(batch map[string]map[string]map[uint64]*roarin
 		}
 	}
 	return batches
+}
+
+
+func (c *Client) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
+
+    ctx, cancel := context.WithTimeout(context.Background(), Deadline * time.Second)
+    defer cancel()
+
+	c.nodeMapLock.RLock()
+	defer c.nodeMapLock.RUnlock()
+
+	// Split query fragments by shard key into separate client queries
+    clientQueries := make([]*pb.BitmapQuery, len(c.client))
+    for i, _ := range clientQueries {
+       clientQueries[i] = &pb.BitmapQuery{Query: []*pb.QueryFragment{}}
+    }
+
+   	for _, v := range query.Query {
+        if v.Index == "" {
+            return nil, fmt.Errorf("Index not specified for query fragment %#v", v)
+        }
+        if v.Field == "" {
+            return nil, fmt.Errorf("Field not specified for query fragment %#v", v)
+        }
+		nodeKeys := c.hashTable.GetN(c.Replicas, fmt.Sprintf("%s/%s/%d", v.Index, v.Field, v.RowID))
+		for _, nodeKey := range nodeKeys {
+    		if i, ok := c.nodeMap[nodeKey]; ok {
+				clientQueries[i].Query = append(clientQueries[i].Query, v)
+			}
+		}
+	}
+
+	result := roaring.NewBitmap()
+	for i, q := range clientQueries {
+		if len(q.Query) == 0 {
+			continue
+		}
+		if buf, err := c.client[i].Query(ctx, q); err != nil {
+            return nil, fmt.Errorf("Error executing query - %v", err)
+		} else {
+			bm := roaring.NewBitmap()
+			if err := bm.UnmarshalBinary(buf.Value); err != nil {
+            	return nil, fmt.Errorf("Error unmarshalling query result - %v", err)
+			} else {
+				result = roaring.ParOr(0, result, bm)
+			}
+		}
+	}
+    return result, nil
+}
+
+
+func (c *Client) CountQuery(query *pb.BitmapQuery) (uint64, error) {
+
+	if result, err := c.query(query); err != nil {
+		return 0, err
+	} else {
+		return result.GetCardinality(), nil
+	}
+}
+
+
+func (c *Client) ResultsQuery(query *pb.BitmapQuery, limit uint64) ([]uint32, error) {
+
+	if result, err := c.query(query); err != nil {
+		return []uint32{}, err
+	} else {
+		if result.GetCardinality() > limit {
+			ra := make([]uint32, 0)
+			iter := result.Iterator()
+			for iter.HasNext() {
+				ra = append(ra, iter.Next())
+			}
+			return ra, nil
+		} else {
+			return result.ToArray(), nil
+		}
+	}
 }
 
 

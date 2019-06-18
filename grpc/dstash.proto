@@ -19,6 +19,7 @@ service DStash {
   rpc BatchIndex(stream google.protobuf.StringValue) returns (google.protobuf.Empty) {}
   rpc Search(google.protobuf.StringValue) returns (stream google.protobuf.UInt64Value) {}
   rpc BatchSetBit(stream IndexKVPair) returns (google.protobuf.Empty) {}
+  rpc Query(BitmapQuery) returns (google.protobuf.BytesValue) {}
 }
 
 message Success {
@@ -34,6 +35,25 @@ message IndexKVPair {
   bytes  key = 2;
   bytes  value = 3;
 }
+
+message BitmapQuery {
+  repeated QueryFragment query = 1;
+}
+
+message QueryFragment {
+  string index= 1;
+  string field= 2;
+  uint64 rowID = 3;
+  int64 value = 4;
+
+  enum OpType {
+	INTERSECT = 0;
+	UNION = 1;
+	DIFFERENCE = 2;
+  }
+  OpType operation = 5;
+}
+
 
 message KVPair {
   bytes  key = 1;

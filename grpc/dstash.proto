@@ -13,11 +13,11 @@ service ClusterAdmin {
 }
 
 service KVStore {
-  rpc Put(KVPair) returns (google.protobuf.Empty) {}
-  rpc BatchPut(stream KVPair) returns (google.protobuf.Empty) {}
-  rpc Lookup(KVPair) returns (KVPair) {}
-  rpc BatchLookup(stream KVPair) returns (stream KVPair) {}
-  rpc Items(google.protobuf.Empty) returns (stream KVPair) {}
+  rpc Put(IndexKVPair) returns (google.protobuf.Empty) {}
+  rpc BatchPut(stream IndexKVPair) returns (google.protobuf.Empty) {}
+  rpc Lookup(IndexKVPair) returns (IndexKVPair) {}
+  rpc BatchLookup(stream IndexKVPair) returns (stream IndexKVPair) {}
+  rpc Items(google.protobuf.StringValue) returns (stream IndexKVPair) {}
 }
 
 service StringSearch {
@@ -62,8 +62,3 @@ message QueryFragment {
   OpType operation = 5;
 }
 
-
-message KVPair {
-  bytes  key = 1;
-  bytes  value = 2;
-}

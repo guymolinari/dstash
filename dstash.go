@@ -3,6 +3,7 @@ package main
 import (
     "log"
     "os"
+	"time"
     "gopkg.in/alecthomas/kingpin.v2"
 	"github.com/guymolinari/dstash/server"
 )
@@ -33,6 +34,22 @@ func main() {
     _ = *tls
     _ = *certFile
     _ = *keyFile
+
+	_, err2 := server.NewKVStore(m)
+    if err2 != nil {
+        log.Printf("[node: Cannot initialize kv store config: error: %s", err2)
+    }
+
+	_, err3 := server.NewStringSearch(m)
+    if err3 != nil {
+        log.Printf("[node: Cannot initialize search config: error: %s", err3)
+    }
+
+	start := time.Now()
+	bitmapIndex := server.NewBitmapIndex(m)
+	bitmapIndex.Init()
+	elapsed := time.Since(start)
+	log.Printf("Bitmap index initialized in %v.", elapsed)
 
     node, err := server.Join("dstash", m)
     if err != nil {

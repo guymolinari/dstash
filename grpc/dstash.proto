@@ -8,16 +8,24 @@ package dstash;
 import "google/protobuf/empty.proto";
 import "google/protobuf/wrappers.proto";
 
-service DStash {
+service ClusterAdmin {
+  rpc Status(google.protobuf.Empty) returns (StatusMessage) {}
+}
+
+service KVStore {
   rpc Put(KVPair) returns (google.protobuf.Empty) {}
   rpc BatchPut(stream KVPair) returns (google.protobuf.Empty) {}
   rpc Lookup(KVPair) returns (KVPair) {}
   rpc BatchLookup(stream KVPair) returns (stream KVPair) {}
   rpc Items(google.protobuf.Empty) returns (stream KVPair) {}
-  rpc Status(google.protobuf.Empty) returns (StatusMessage) {}
- 
+}
+
+service StringSearch {
   rpc BatchIndex(stream google.protobuf.StringValue) returns (google.protobuf.Empty) {}
   rpc Search(google.protobuf.StringValue) returns (stream google.protobuf.UInt64Value) {}
+}
+
+service BitmapIndex {
   rpc BatchSetBit(stream IndexKVPair) returns (google.protobuf.Empty) {}
   rpc Query(BitmapQuery) returns (google.protobuf.BytesValue) {}
 }

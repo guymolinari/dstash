@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
 	"github.com/hashicorp/consul/api"
 	"github.com/stvp/rendezvous"
+    "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const (
@@ -39,6 +41,7 @@ type Node struct {
     Err  chan error
     
 }
+
 
 // Join creates a new Node and adds it to the distributed hash table specified
 // by the given name. The given id should be unique among all Nodes in the hash
@@ -78,6 +81,7 @@ func Join(name string, e *EndPoint) (node *Node, err error) {
 	return node, nil
 }
 
+
 func (n *Node) register() (err error) {
 
 	err = n.consul.Agent().ServiceRegister(&api.AgentServiceRegistration{
@@ -90,6 +94,7 @@ func (n *Node) register() (err error) {
 	})
 	return err
 }
+
 
 func (n *Node) poll() {
 	var err error
@@ -112,9 +117,11 @@ func (n *Node) poll() {
 	}
 }
 
+
 // update blocks until the service list changes or until the Consul agent's
 // timeout is reached (10 minutes by default).
 func (n *Node) update() (err error) {
+
 	opts := &api.QueryOptions{WaitIndex: n.waitIndex}
 	serviceEntries, meta, err := n.consul.Health().Service(n.serviceName, "", true, opts)
 	if err != nil {
@@ -152,3 +159,19 @@ func (n *Node) Leave() (err error) {
     //close(n.stop) FIXME: stop the server
 	return err
 }
+
+
+type HealthImpl struct{}
+
+// Check implements the health check interface, which directly returns to health status. There are also more complex health check strategies, such as returning based on server load.
+func (h *HealthImpl) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+    //log.Printf("Health checking ...\n")
+    return &grpc_health_v1.HealthCheckResponse{
+        Status: grpc_health_v1.HealthCheckResponse_SERVING,
+    }, nil
+}
+
+func (h *HealthImpl) Watch(req *grpc_health_v1.HealthCheckRequest, w grpc_health_v1.Health_WatchServer) error {
+    return nil
+}
+

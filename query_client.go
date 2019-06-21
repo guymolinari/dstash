@@ -37,12 +37,13 @@ func main() {
 		log.Fatal("Must specify query .yaml file.")
 	}
 
-    client := dstash.NewDefaultClient()
-    client.ServicePort = 4000
-    if err := client.Connect(); err != nil {
+    conn := dstash.NewDefaultConnection()
+    conn.ServicePort = 4000
+    if err := conn.Connect(); err != nil {
         log.Fatal(err)
     }
 
+	client := dstash.NewBitmapIndex(conn, 2000000)
   
     q := BitmapQuery{}
 

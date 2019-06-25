@@ -6,14 +6,14 @@ import (
 	"log"
 	"sync"
 	"time"
-    pb "github.com/guymolinari/dstash/grpc"
     "github.com/RoaringBitmap/roaring"
+    pb "github.com/guymolinari/dstash/grpc"
 )
 
 type BitmapIndex struct {
 	*Conn
     client				[]pb.BitmapIndexClient
-    batch		 	 	map[string]map[string]map[uint64]*roaring.Bitmap
+    batch		 	 	map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap
     batchSize         	int
     batchCount        	int
     batchMutex         	sync.Mutex
@@ -51,17 +51,20 @@ func (c *BitmapIndex) SetBit(index, field string, columnID, rowID uint64, ts tim
     defer c.batchMutex.Unlock()
 
 	if c.batch == nil {
-		c.batch = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+		c.batch = make(map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap)
 	}
 	if _, ok := c.batch[index]; !ok {
-		c.batch[index] = make(map[string]map[uint64]*roaring.Bitmap)
+		c.batch[index] = make(map[string]map[uint64]map[time.Time]*roaring.Bitmap)
 	}
 	if _, ok := c.batch[index][field]; !ok {
-		c.batch[index][field] = make(map[uint64]*roaring.Bitmap)
+		c.batch[index][field] = make(map[uint64]map[time.Time]*roaring.Bitmap)
 	}
-    if bmap, ok := c.batch[index][field][rowID]; !ok {
+	if _, ok := c.batch[index][field][rowID]; !ok {
+		c.batch[index][field][rowID] = make(map[time.Time]*roaring.Bitmap)
+	}
+    if bmap, ok := c.batch[index][field][rowID][ts]; !ok {
 		b := roaring.BitmapOf(uint32(columnID))
-		c.batch[index][field][rowID] = b
+		c.batch[index][field][rowID][ts] = b
 	} else {
 		bmap.Add(uint32(columnID))
 	}
@@ -84,7 +87,7 @@ func (c *BitmapIndex) SetBit(index, field string, columnID, rowID uint64, ts tim
 }
 
 
-func (c *BitmapIndex) BatchSetBit(batch map[string]map[string]map[uint64]*roaring.Bitmap) error {
+func (c *BitmapIndex) BatchSetBit(batch map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap) error {
 
     batches := c.splitBitmapBatch(batch, c.Conn.Replicas)
 
@@ -92,7 +95,7 @@ func (c *BitmapIndex) BatchSetBit(batch map[string]map[string]map[uint64]*roarin
     defer close(done)
     count := len(batches)
     for i, v := range batches {
-        go func(client pb.BitmapIndexClient, m map[string]map[string]map[uint64]*roaring.Bitmap) {
+        go func(client pb.BitmapIndexClient, m map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap) {
 			done <- c.batchSetBit(client, m)
 		}(c.client[i], v)
 	}
@@ -111,7 +114,7 @@ func (c *BitmapIndex) BatchSetBit(batch map[string]map[string]map[uint64]*roarin
 
 
 func (c *BitmapIndex) batchSetBit(client pb.BitmapIndexClient, 
-		batch map[string]map[string]map[uint64]*roaring.Bitmap) error {
+		batch map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap) error {
 
     ctx, cancel := context.WithTimeout(context.Background(), Deadline)
     defer cancel()
@@ -119,15 +122,18 @@ func (c *BitmapIndex) batchSetBit(client pb.BitmapIndexClient,
     i := 0
    	for indexName, index := range batch {
         for fieldName, field := range index {
-            for rowID, bitmap := range field {
-				buf, err := bitmap.ToBytes()
-				if err != nil {
-        			log.Printf("bitmap.ToBytes: %v", err)
-					return err
+	        for rowID, ts := range field {
+	        	for t, bitmap := range ts {
+					buf, err := bitmap.ToBytes()
+					if err != nil {
+	        			log.Printf("bitmap.ToBytes: %v", err)
+						return err
+					}
+					b = append(b, &pb.IndexKVPair{IndexPath: indexName + "/" + fieldName, 
+						Key: ToBytes(rowID), Value: buf, Time: t.UnixNano()})
+					i++
+					//log.Printf("Sent batch %d for path %s\n", i, b[i].IndexPath)
 				}
-				b = append(b, &pb.IndexKVPair{IndexPath: indexName + "/" + fieldName, Key: ToBytes(rowID), Value: buf})
-				i++
-				//log.Printf("Sent batch %d for path %s\n", i, b[i].IndexPath)
 			}
 		}
     }
@@ -152,33 +158,38 @@ func (c *BitmapIndex) batchSetBit(client pb.BitmapIndexClient,
 }
 
 
-func (c *BitmapIndex) splitBitmapBatch(batch map[string]map[string]map[uint64]*roaring.Bitmap, 
-		replicas int) []map[string]map[string]map[uint64]*roaring.Bitmap {
+func (c *BitmapIndex) splitBitmapBatch(batch map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap, 
+		replicas int) []map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap {
 
 	c.Conn.nodeMapLock.RLock()
 	defer c.Conn.nodeMapLock.RUnlock()
 
-    batches := make([]map[string]map[string]map[uint64]*roaring.Bitmap, len(c.client))
+    batches := make([]map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap, len(c.client))
     for i, _ := range batches {
-        batches[i] = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+        batches[i] = make(map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap)
     }
 
 	for indexName, index := range batch {
 		for fieldName, field := range index {
-			for rowID, bitmap := range field {
+			for rowID, ts := range field {
 				nodeKeys := c.Conn.hashTable.GetN(replicas, fmt.Sprintf("%s/%s/%d", indexName, fieldName, rowID))
 				for _, nodeKey := range nodeKeys {
 					if i, ok := c.Conn.nodeMap[nodeKey]; ok {
-						if batches[i] == nil {
-							batches[i] = make(map[string]map[string]map[uint64]*roaring.Bitmap)
+						for t, bitmap := range ts {
+							if batches[i] == nil {
+								batches[i] = make(map[string]map[string]map[uint64]map[time.Time]*roaring.Bitmap)
+							}
+							if _, ok := batches[i][indexName]; !ok {
+								batches[i][indexName] = make(map[string]map[uint64]map[time.Time]*roaring.Bitmap)
+							}
+							if _, ok := batches[i][indexName][fieldName]; !ok {
+								batches[i][indexName][fieldName] = make(map[uint64]map[time.Time]*roaring.Bitmap)
+							}
+							if _, ok := batches[i][indexName][fieldName][rowID]; !ok {
+								batches[i][indexName][fieldName][rowID] = make(map[time.Time]*roaring.Bitmap)
+							}
+							batches[i][indexName][fieldName][rowID][t] = bitmap
 						}
-						if _, ok := batches[i][indexName]; !ok {
-							batches[i][indexName] = make(map[string]map[uint64]*roaring.Bitmap)
-						}
-						if _, ok := batches[i][indexName][fieldName]; !ok {
-							batches[i][indexName][fieldName] = make(map[uint64]*roaring.Bitmap)
-						}
-						batches[i][indexName][fieldName][rowID] = bitmap
 					}
 				}
 			}
@@ -199,7 +210,7 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 	// Split query fragments by shard key into separate client queries
     clientQueries := make([]*pb.BitmapQuery, len(c.client))
     for i, _ := range clientQueries {
-       clientQueries[i] = &pb.BitmapQuery{Query: []*pb.QueryFragment{}}
+       clientQueries[i] = &pb.BitmapQuery{Query: []*pb.QueryFragment{}, FromTime: query.FromTime, ToTime: query.ToTime}
     }
 
    	for _, v := range query.Query {

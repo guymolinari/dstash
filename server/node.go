@@ -60,6 +60,7 @@ func Join(name string, e *EndPoint) (node *Node, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("node: can't create Consul API client: %s", err)
 	}
+	e.consul = node.consul
 
     go func() {
 		defer close(node.Stop)

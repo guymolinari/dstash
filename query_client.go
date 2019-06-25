@@ -20,6 +20,8 @@ type QueryFragment struct {
 
 
 type BitmapQuery struct {
+    FromTime     string `yaml:"fromTime"`
+    ToTime       string `yaml:"toTime"`
 	Query        []*QueryFragment `yaml:"query,omitempty"`
 }
 
@@ -91,6 +93,13 @@ func toProto(query *BitmapQuery) *pb.BitmapQuery {
 		}
 		frags[i] = &pb.QueryFragment{Index: f.Index, Field: f.Field, RowID: f.RowID, Operation: op}
 	}
-	return &pb.BitmapQuery{Query: frags}
+	bq :=  &pb.BitmapQuery{Query: frags}
+	if fromTime, err := time.Parse("2006-01-02T15", query.FromTime); err == nil {
+		bq.FromTime = fromTime.UnixNano()
+	}
+	if toTime, err := time.Parse("2006-01-02T15", query.ToTime); err == nil {
+		bq.ToTime = toTime.UnixNano()
+	}
+	return bq
 }
 

@@ -39,18 +39,21 @@ message StatusMessage {
 }
 
 message IndexKVPair {
-  string indexPath = 1;
-  bytes  key = 2;
-  bytes  value = 3;
+  string 	indexPath = 1;
+  bytes  	key = 2;
+  bytes  	value = 3;
+  int64 	time = 4;
 }
 
 message BitmapQuery {
   repeated QueryFragment query = 1;
+  int64    fromTime = 2;
+  int64    toTime = 3;
 }
 
 message QueryFragment {
-  string index= 1;
-  string field= 2;
+  string index = 1;
+  string field = 2;
   uint64 rowID = 3;
   int64 value = 4;
 

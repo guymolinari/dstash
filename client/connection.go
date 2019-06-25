@@ -139,7 +139,14 @@ func (c *Conn) Disconnect() error {
 	    c.clientConn[i].Close()
     	c.admin[i] = nil
 	}
-    close(c.stop)
+	select {
+	case _, open := <- c.stop:
+		if open {
+    		close(c.stop)
+		}
+	default:
+		close(c.stop)
+	}
 	return nil
 }
 

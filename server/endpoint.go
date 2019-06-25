@@ -10,6 +10,7 @@ import (
     "google.golang.org/grpc"
     "google.golang.org/grpc/credentials"
     "google.golang.org/grpc/testdata"
+	"github.com/hashicorp/consul/api"
     "github.com/golang/protobuf/ptypes/empty"
     "google.golang.org/grpc/health/grpc_health_v1"
     pb "github.com/guymolinari/dstash/grpc"
@@ -29,6 +30,7 @@ type EndPoint struct {
 	dataDir		  string
     hashKey       string
 	server		  *grpc.Server
+	consul    	  *api.Client
 }
 
 

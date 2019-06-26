@@ -1,7 +1,7 @@
 package server
 
 import (
-    "context"
+	"bytes"
     "encoding/binary"
     "fmt"
     "io"
@@ -490,17 +490,17 @@ func (m *BitmapIndex) checkPersistBitmapCache() {
 }
 
 
-func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappers.BytesValue, error) {
+func (m *BitmapIndex) Query(query *pb.BitmapQuery, stream pb.BitmapIndex_QueryServer) error {
 
     if query == nil {
-		return &wrappers.BytesValue{}, fmt.Errorf("query must not be nil")
+		return fmt.Errorf("query must not be nil")
 	}
 	
     if query.Query == nil {
-		return &wrappers.BytesValue{}, fmt.Errorf("query fragment array must not be nil")
+		return fmt.Errorf("query fragment array must not be nil")
 	}
     if len(query.Query) == 0 {
-		return &wrappers.BytesValue{}, fmt.Errorf("query fragment array must not be empty")
+		fmt.Errorf("query fragment array must not be empty")
 	}
 	fromTime := time.Unix(0, query.FromTime)
 	toTime := time.Unix(0, query.ToTime)
@@ -510,16 +510,16 @@ func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappe
 	result := roaring.NewBitmap()
 	for _, v := range query.Query {
 		if v.Index == "" {
-			return nil, fmt.Errorf("Index not specified for query fragment %#v", v)
+			fmt.Errorf("Index not specified for query fragment %#v", v)
 		}
 		if v.Field == "" {
-			return nil, fmt.Errorf("Field not specified for query fragment %#v", v)
+			fmt.Errorf("Field not specified for query fragment %#v", v)
 		}
 		
 		var bm *roaring.Bitmap
 		var err error
 		if bm, err = m.timeRange(v.Index, v.Field, v.RowID, fromTime, toTime); err != nil {
-			return &wrappers.BytesValue{Value: []byte("")}, err
+			return err
 		}
 
 		if firstTime  {
@@ -537,11 +537,21 @@ func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappe
 	}
 
 	if buf, err := result.MarshalBinary(); err != nil {
-		return &wrappers.BytesValue{Value: []byte("")}, 
-			fmt.Errorf("Cannot marshal result roaring bitmap - %v", err)
+		return fmt.Errorf("Cannot marshal result roaring bitmap - %v", err)
 	} else {
-		return &wrappers.BytesValue{Value: buf}, nil
+		reader := bytes.NewReader(buf)
+		b := make([]byte, 1024 * 1024)
+		for {
+			n, err := reader.Read(b)
+			if err == io.EOF {
+				break
+			}
+			if err := stream.Send(&wrappers.BytesValue{Value: b[:n]}); err != nil {
+				return err
+			}
+		}
 	}
+	return nil
 }
 
 

@@ -1,8 +1,10 @@
 package dstash
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -233,11 +235,26 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 		if len(q.Query) == 0 {
 			continue
 		}
-		if buf, err := c.client[i].Query(ctx, q); err != nil {
+		if stream, err := c.client[i].Query(ctx, q); err != nil {
             return nil, fmt.Errorf("Error executing query - %v", err)
 		} else {
+			var writer bytes.Buffer
+			for {
+        		packet, err := stream.Recv()
+        		if err == io.EOF {
+            		break
+        		}
+				if err != nil {
+            		fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err)
+        		}
+				_, err2 := writer.Write(packet.Value)
+				if err2 != nil {
+            		fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err2)
+        		}
+			}
+
 			bm := roaring.NewBitmap()
-			if err := bm.UnmarshalBinary(buf.Value); err != nil {
+			if err := bm.UnmarshalBinary(writer.Bytes()); err != nil {
             	return nil, fmt.Errorf("Error unmarshalling query result - %v", err)
 			} else {
 				result = roaring.FastOr(result, bm)

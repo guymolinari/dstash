@@ -27,7 +27,7 @@ service StringSearch {
 
 service BitmapIndex {
   rpc BatchSetBit(stream IndexKVPair) returns (google.protobuf.Empty) {}
-  rpc Query(BitmapQuery) returns (google.protobuf.BytesValue) {}
+  rpc Query(BitmapQuery) returns (stream google.protobuf.BytesValue) {}
 }
 
 message Success {

@@ -15,7 +15,7 @@ type QueryFragment struct {
     Index        string    	`yaml:"index"`
     Field        string     `yaml:"field"`
     RowID        uint64     `yaml:"rowID"`
-    Operation    string		`yaml:"op"`
+    Operation    string		`yaml:"op,omitempty"`
 }
 
 
@@ -35,8 +35,22 @@ func main() {
 	q := &BitmapQuery{Query: []*QueryFragment{f1, f2, f3}}
 */
 
-	if len(os.Args) < 2 {
-		log.Fatal("Must specify query .yaml file.")
+	var usage error
+	if len(os.Args) < 3 {
+		usage = fmt.Errorf("Must specify query .yaml file.")
+	}
+	var action string
+	switch os.Args[1] {
+	case "count":
+		action = "count"
+	case "results":
+		action = "results"
+	default:
+		usage = fmt.Errorf("action must be 'count' or 'results'.")
+	}
+	if usage != nil {
+		log.Printf("%v", usage)
+		log.Fatalf("Usage query_client count|results [yaml_file]")
 	}
 
     conn := dstash.NewDefaultConnection()
@@ -49,7 +63,7 @@ func main() {
   
     q := BitmapQuery{}
 
-	data, err := ioutil.ReadFile(os.Args[1])
+	data, err := ioutil.ReadFile(os.Args[2])
     if err != nil {
         fmt.Printf("error: %v", err)
     }
@@ -63,16 +77,30 @@ func main() {
     if err != nil {
         fmt.Printf("error: %v", err)
     }
-    fmt.Printf("--- t dump:\n%s\n\n", string(d))
+    fmt.Printf("vvv query dump:\n%s\n\n", string(d))
 
-	start := time.Now()
-	count, err := client.CountQuery(toProto(&q))
-	if err != nil {
-		log.Fatalf("Error during server call to CountQuery - %v", err)
+	if action == "count" {
+		start := time.Now()
+		count, err := client.CountQuery(toProto(&q))
+		if err != nil {
+			log.Fatalf("Error during server call to CountQuery - %v", err)
+		}
+		elapsed := time.Since(start)
+		log.Printf("Results = %d, elapsed time %v", count, elapsed)
 	}
-	
-	elapsed := time.Since(start)
-	log.Printf("Results = %d, elapsed time %v", count, elapsed)
+	if action == "results" {
+		start := time.Now()
+		results, err := client.ResultsQuery(toProto(&q), 10000)
+		if err != nil {
+			log.Fatalf("Error during server call to ResultsQuery - %v", err)
+		}
+		elapsed := time.Since(start)
+		for i := 0; i < 10000; i++ {
+			fmt.Printf("%d, ", results[i])
+		}
+		log.Println("Done.")
+		log.Printf("Elapsed time %v", elapsed)
+	}
 }
 
 

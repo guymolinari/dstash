@@ -31,7 +31,6 @@ type BitmapIndex struct {
     setBitThreads 		*CountTrigger
     writeSignal   		chan bool
 	tableCache	  		map[string]*shared.Table
-	tableCacheLock		sync.RWMutex
 }
 
 
@@ -39,6 +38,13 @@ func NewBitmapIndex(endPoint *EndPoint) *BitmapIndex {
 
     e := &BitmapIndex{EndPoint: endPoint}
 	e.tableCache = make(map[string]*shared.Table)
+	configPath := endPoint.dataDir + SEP + "config"
+    index := "user360"
+	if table, err := shared.LoadSchema(configPath, index, "", endPoint.consul); err != nil {
+		log.Fatalf("ERROR: Could not load schema for %s - %v", index, err)
+	} else {
+		e.tableCache[index] = table
+	}
     pb.RegisterBitmapIndexServer(endPoint.server, e)
     return e
 }
@@ -46,9 +52,9 @@ func NewBitmapIndex(endPoint *EndPoint) *BitmapIndex {
 
 func (m *BitmapIndex) Init() error {
 
-    m.fragQueue = make(chan *BitmapFragment, 1000000)
+    m.fragQueue = make(chan *BitmapFragment, 20000000)
     m.bitmapCache = make(map[string]map[string]map[uint64]map[time.Time]*StandardBitmap)
-    m.workers = 3
+    m.workers = 5
     m.writeSignal = make(chan bool, 1)
     m.setBitThreads = NewCountTrigger(m.writeSignal)
 
@@ -56,6 +62,7 @@ func (m *BitmapIndex) Init() error {
         go m.batchLoadProcessLoop(i + 1)
     }
     go m.overflowProcessLoop()
+    //go m.persistenceProcessLoop()
 
     // Read files from disk
     m.readBitmapFiles(m.fragQueue, true)
@@ -251,21 +258,7 @@ func (m *BitmapIndex) newFragmentFile(index, field string, rowID uint64, ts time
 
 func (m *BitmapIndex) getTimeQuantum(index, field string) string {
 
-	m.tableCacheLock.Lock()
-	defer m.tableCacheLock.Unlock()
-
-	var err error
-	table, ok := m.tableCache[index]
-	if !ok {
-		configPath := m.EndPoint.dataDir + SEP + "config"
-		//m.tableCacheLock.Lock()
-		if table, err = shared.LoadSchema(configPath, index, "", m.EndPoint.consul); err != nil {
-			log.Printf("ERROR: Could not load schema for %s - %v", index, err)
-		} else {
-			m.tableCache[index] = table
-		}
-		//m.tableCacheLock.Unlock()
-	}
+	table := m.tableCache[index]
 	timeQuantum := table.TimeQuantumType
 	attr, err2 := table.GetAttribute(field)
 	if err2 != nil {
@@ -380,11 +373,12 @@ func (m *BitmapIndex) batchLoadProcessLoop(threadID int) {
 
 	log.Printf("batchLoadProcess [Thread #%d] - Started.", threadID)
 	for {
+		// This is a way to make sure that the fraq queue has priority over persistence.
 		select {
 		case frag := <- m.fragQueue:
 			m.updateBitmapCache(frag)
 			continue
-		default:
+		default:	// Don't block
 		}
 		select {
 		case frag := <- m.fragQueue:
@@ -408,6 +402,17 @@ func (m *BitmapIndex) overflowProcessLoop() {
 		time.Sleep(time.Second)
 	}
 	log.Printf("overflowProcessLoop - Ended.")
+}
+
+
+func (m *BitmapIndex) persistenceProcessLoop() {
+
+	log.Printf("persistenceProcessLoop - Started.")
+	for {
+		m.checkPersistBitmapCache()
+		time.Sleep(time.Second * 10)
+	}
+	log.Printf("persistenceProcessLoop - Ended.")
 }
 
 
@@ -435,14 +440,14 @@ func (m *BitmapIndex) updateBitmapCache(f *BitmapFragment) {
 		m.bitmapCache[f.IndexName][f.FieldName][f.RowID][f.Time] = newBm
 		m.bitmapCacheLock.Unlock()
 	} else {
-		m.bitmapCacheLock.Unlock()
 		existBm.Lock.Lock()
-        existBm.Bits = roaring.ParOr(0, existBm.Bits, newBm.Bits)
+		m.bitmapCacheLock.Unlock()
+        existBm.Bits = roaring.FastOr(existBm.Bits, newBm.Bits)
 		existBm.ModTime = time.Now()
 		existBm.Lock.Unlock()
 	}
     elapsed := time.Since(start)
-	if elapsed.Nanoseconds() > 10000000 {
+	if elapsed.Nanoseconds() > (1000000 * 25) {
     	log.Printf("updateBitmapCache [%s/%s/%d] done in %v.\n", f.IndexName, f.FieldName, f.RowID,  elapsed)
 	}
 }
@@ -453,6 +458,8 @@ func (m *BitmapIndex) checkPersistBitmapCache() {
 	m.bitmapCacheLock.RLock()
 	defer m.bitmapCacheLock.RUnlock()
 
+    updateCount := 0
+	start := time.Now()
     for indexName, index := range m.bitmapCache {
         for fieldName, field := range index {
 	        for rowID, ts := range field {
@@ -460,7 +467,6 @@ func (m *BitmapIndex) checkPersistBitmapCache() {
 					lastModSecs := time.Since(bitmap.ModTime).Round(time.Second)
 					if dur, _ := time.ParseDuration("60s"); lastModSecs >= dur {
 						bitmap.Lock.Lock()
-	   					start := time.Now()
 						if create, update := m.shouldWriteFile(indexName, fieldName, rowID, t, bitmap.TQType,
 								bitmap.ModTime); create || update {
 							if err := m.saveCompleteBitmap(bitmap, indexName, fieldName, rowID, t, create); err != nil {
@@ -468,15 +474,18 @@ func (m *BitmapIndex) checkPersistBitmapCache() {
 								bitmap.Lock.Unlock()
 								return
 							}
-		    				elapsed := time.Since(start)
-		    				log.Printf("Persist [%s/%s/%d/%s] done in %v. Last mod %v seconds ago.", indexName, 
-							 	fieldName, rowID, t.Format("2006-01-02T15"), elapsed, lastModSecs)
+							updateCount++
 						}
 						bitmap.Lock.Unlock()
 					}
 				}
 			}
 		}
+	}
+
+	elapsed := time.Since(start)
+	if updateCount > 0 {
+		log.Printf("Persist %d files done in %v", updateCount, elapsed)
 	}
 }
 
@@ -509,8 +518,6 @@ func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappe
 		
 		var bm *roaring.Bitmap
 		var err error
-		m.bitmapCacheLock.RLock()
-		defer m.bitmapCacheLock.RUnlock()
 		if bm, err = m.timeRange(v.Index, v.Field, v.RowID, fromTime, toTime); err != nil {
 			return &wrappers.BytesValue{Value: []byte("")}, err
 		}
@@ -522,9 +529,9 @@ func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappe
 			continue
 		}
 		if prevOp == pb.QueryFragment_INTERSECT {
-			result = roaring.ParAnd(0, result, bm)
+			result = roaring.FastAnd(result, bm)
 		} else {
-			result = roaring.ParOr(0, result, bm)
+			result = roaring.FastOr(result, bm)
 		}
 		prevOp = v.Operation
 	}
@@ -540,30 +547,40 @@ func (m *BitmapIndex) Query(ctx context.Context, query *pb.BitmapQuery) (*wrappe
 
 func (m *BitmapIndex) timeRange(index, field string, rowID uint64, fromTime, toTime time.Time) (*roaring.Bitmap, error) {
     
+	m.bitmapCacheLock.RLock()
+	defer m.bitmapCacheLock.RUnlock()
+
     tq := m.getTimeQuantum(index, field)
 	result := roaring.NewBitmap()
 	yr, mn, da := fromTime.Date()
 	lookupTime := time.Date(yr, mn, da, 0, 0, 0, 0, time.UTC)
+	a := make([]*roaring.Bitmap, 0)
 
 	if tq == "YMD" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.AddDate(0, 0, 1) {
 			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime]; !ok {
-				return nil, fmt.Errorf("Cannot find value for YMD [%s/%s/%d/%s]", index, field, rowID, 
+				err := fmt.Errorf("Cannot find value for YMD [%s/%s/%d/%s]", index, field, rowID, 
 						lookupTime.Format("2006-01-02T15"))
+				log.Println(err)
+				return nil, err
 			} else {
-				result = roaring.ParOr(0, result, bm.Bits)
+				a = append(a, bm.Bits)
 			}
 		}
+		result = roaring.ParOr(0, a...)
 	}
 	if tq == "YMDH" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.Add(time.Hour) {
 			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime]; !ok {
-				return nil, fmt.Errorf("Cannot find value for YMDH [%s/%s/%d/%s]", index, field, rowID, 
+				err := fmt.Errorf("Cannot find value for YMDH [%s/%s/%d/%s]", index, field, rowID, 
 						lookupTime.Format("2006-01-02T15"))
+				log.Println(err)
+				return nil, err
 			} else {
-				result = roaring.ParOr(0, result, bm.Bits)
+				a = append(a, bm.Bits)
 			}
 		}
+		result = roaring.ParOr(0, a...)
 	}
 	return result, nil
 }
@@ -586,9 +603,14 @@ func NewCountTrigger(t chan bool) *CountTrigger {
  */
 func (c *CountTrigger) Add(n int) {
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.num += n
 	if c.num == 0 {
-		c.trigger <- true
+		select {
+		case c.trigger <- true:
+			return
+		//default:
+		//	return
+		}
 	}
-	c.lock.Unlock()
 }

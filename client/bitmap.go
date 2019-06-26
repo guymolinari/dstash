@@ -240,7 +240,7 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 			if err := bm.UnmarshalBinary(buf.Value); err != nil {
             	return nil, fmt.Errorf("Error unmarshalling query result - %v", err)
 			} else {
-				result = roaring.ParOr(0, result, bm)
+				result = roaring.FastOr(result, bm)
 			}
 		}
 	}

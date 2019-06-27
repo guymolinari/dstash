@@ -245,11 +245,11 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
             		break
         		}
 				if err != nil {
-            		fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err)
+            		return nil, fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err)
         		}
 				_, err2 := writer.Write(packet.Value)
 				if err2 != nil {
-            		fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err2)
+            		return nil, fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err2)
         		}
 			}
 

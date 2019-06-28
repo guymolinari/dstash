@@ -23,7 +23,7 @@ import (
 
 type BitmapIndex struct {
     *EndPoint
-    bitmapCache   		map[string]map[string]map[uint64]map[time.Time]*StandardBitmap
+    bitmapCache   		map[string]map[string]map[uint64]map[int64]*StandardBitmap
     bitmapCacheLock   	sync.RWMutex
     fragQueue     		chan *BitmapFragment
     workers       		int
@@ -53,7 +53,7 @@ func NewBitmapIndex(endPoint *EndPoint) *BitmapIndex {
 func (m *BitmapIndex) Init() error {
 
     m.fragQueue = make(chan *BitmapFragment, 20000000)
-    m.bitmapCache = make(map[string]map[string]map[uint64]map[time.Time]*StandardBitmap)
+    m.bitmapCache = make(map[string]map[string]map[uint64]map[int64]*StandardBitmap)
     m.workers = 5
     m.writeSignal = make(chan bool, 1)
     m.setBitThreads = NewCountTrigger(m.writeSignal)
@@ -165,7 +165,7 @@ type StandardBitmap struct {
 
 
 func newStandardBitmap(timeQuantumType string) *StandardBitmap {
-	return &StandardBitmap{Bits: roaring.NewBitmap(), ModTime: time.Now().Add(time.Second * 10),
+	return &StandardBitmap{Bits: roaring.NewBitmap(), ModTime: time.Now(),
 		TQType: timeQuantumType}
 }
 
@@ -181,7 +181,8 @@ type BitmapFragment struct {
 
 
 func newBitmapFragment(index, field string, rowID uint64, ts time.Time, f []byte) *BitmapFragment {
-	return &BitmapFragment{IndexName: index, FieldName: field, RowID: rowID, Time: ts, BitData: f}
+	return &BitmapFragment{IndexName: index, FieldName: field, RowID: rowID, Time: ts, BitData: f, 
+		ModTime: time.Now()}
 }
 
 
@@ -380,12 +381,16 @@ func (m *BitmapIndex) batchLoadProcessLoop(threadID int) {
 			continue
 		default:	// Don't block
 		}
+
 		select {
 		case frag := <- m.fragQueue:
 			m.updateBitmapCache(frag)
 			continue
 		case <- m.writeSignal:
-			m.checkPersistBitmapCache()
+			go m.checkPersistBitmapCache(false)
+			continue
+		case <-time.After(time.Second * 10):
+			m.checkPersistBitmapCache(true)
 		}
 	}
 	log.Printf("batchLoadProcess [Thread #%d] - Ended.", threadID)
@@ -405,6 +410,7 @@ func (m *BitmapIndex) overflowProcessLoop() {
 }
 
 
+/*
 func (m *BitmapIndex) persistenceProcessLoop() {
 
 	log.Printf("persistenceProcessLoop - Started.")
@@ -414,6 +420,7 @@ func (m *BitmapIndex) persistenceProcessLoop() {
 	}
 	log.Printf("persistenceProcessLoop - Ended.")
 }
+*/
 
 
 func (m *BitmapIndex) updateBitmapCache(f *BitmapFragment) {
@@ -422,28 +429,29 @@ func (m *BitmapIndex) updateBitmapCache(f *BitmapFragment) {
 
    	start := time.Now()
 	newBm := newStandardBitmap(m.getTimeQuantum(f.IndexName, f.FieldName))
+	newBm.ModTime = f.ModTime
 	if err := newBm.Bits.UnmarshalBinary(f.BitData); err != nil {
 		log.Printf("updateBitmapCache - UnmarshalBinary error - %v", err)
 		return
 	}
 	m.bitmapCacheLock.Lock()
 	if _, ok := m.bitmapCache[f.IndexName]; !ok {
-		m.bitmapCache[f.IndexName] = make(map[string]map[uint64]map[time.Time]*StandardBitmap)
+		m.bitmapCache[f.IndexName] = make(map[string]map[uint64]map[int64]*StandardBitmap)
 	}
 	if _, ok := m.bitmapCache[f.IndexName][f.FieldName]; !ok {
-		m.bitmapCache[f.IndexName][f.FieldName] = make(map[uint64]map[time.Time]*StandardBitmap)
+		m.bitmapCache[f.IndexName][f.FieldName] = make(map[uint64]map[int64]*StandardBitmap)
 	}
 	if _, ok := m.bitmapCache[f.IndexName][f.FieldName][f.RowID]; !ok {
-		m.bitmapCache[f.IndexName][f.FieldName][f.RowID] = make(map[time.Time]*StandardBitmap)
+		m.bitmapCache[f.IndexName][f.FieldName][f.RowID] = make(map[int64]*StandardBitmap)
 	}
-	if existBm, ok := m.bitmapCache[f.IndexName][f.FieldName][f.RowID][f.Time]; !ok {
-		m.bitmapCache[f.IndexName][f.FieldName][f.RowID][f.Time] = newBm
+	if existBm, ok := m.bitmapCache[f.IndexName][f.FieldName][f.RowID][f.Time.UnixNano()]; !ok {
+		m.bitmapCache[f.IndexName][f.FieldName][f.RowID][f.Time.UnixNano()] = newBm
 		m.bitmapCacheLock.Unlock()
 	} else {
 		existBm.Lock.Lock()
 		m.bitmapCacheLock.Unlock()
         existBm.Bits = roaring.FastOr(existBm.Bits, newBm.Bits)
-		existBm.ModTime = time.Now()
+		existBm.ModTime = f.ModTime
 		existBm.Lock.Unlock()
 	}
     elapsed := time.Since(start)
@@ -453,39 +461,46 @@ func (m *BitmapIndex) updateBitmapCache(f *BitmapFragment) {
 }
 
 
-func (m *BitmapIndex) checkPersistBitmapCache() {
+func (m *BitmapIndex) checkPersistBitmapCache(forceSync bool) {
 
 	m.bitmapCacheLock.RLock()
 	defer m.bitmapCacheLock.RUnlock()
 
-    updateCount := 0
+    writeCount := 0
 	start := time.Now()
     for indexName, index := range m.bitmapCache {
         for fieldName, field := range index {
 	        for rowID, ts := range field {
 	            for t, bitmap := range ts {
-					lastModSecs := time.Since(bitmap.ModTime).Round(time.Second)
-					if dur, _ := time.ParseDuration("60s"); lastModSecs >= dur {
-						bitmap.Lock.Lock()
-						if create, update := m.shouldWriteFile(indexName, fieldName, rowID, t, bitmap.TQType,
-								bitmap.ModTime); create || update {
-							if err := m.saveCompleteBitmap(bitmap, indexName, fieldName, rowID, t, create); err != nil {
+					bitmap.Lock.Lock()
+					lastModSecs := time.Since(bitmap.ModTime)
+					if dur, _ := time.ParseDuration("60s"); lastModSecs >= dur  || forceSync {
+						if create, update := m.shouldWriteFile(indexName, fieldName, rowID, time.Unix(0, t), 
+								bitmap.TQType, bitmap.ModTime); create || update {
+							if err := m.saveCompleteBitmap(bitmap, indexName, fieldName, rowID, time.Unix(0, t), 
+									create); err != nil {
 								log.Printf("saveCompleteBitmap failed! - %v", err)
 								bitmap.Lock.Unlock()
 								return
 							}
-							updateCount++
+							if create || update {
+								writeCount++
+							}
 						}
-						bitmap.Lock.Unlock()
 					}
+					bitmap.Lock.Unlock()
 				}
 			}
 		}
 	}
 
 	elapsed := time.Since(start)
-	if updateCount > 0 {
-		log.Printf("Persist %d files done in %v", updateCount, elapsed)
+	if writeCount > 0 {
+		if forceSync {
+			log.Printf("Persist [timer expired] %d files done in %v", writeCount, elapsed)
+		} else {
+			log.Printf("Persist [edge triggered] %d files done in %v", writeCount, elapsed)
+		}
 	}
 }
 
@@ -568,7 +583,7 @@ func (m *BitmapIndex) timeRange(index, field string, rowID uint64, fromTime, toT
 
 	if tq == "YMD" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.AddDate(0, 0, 1) {
-			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime]; !ok {
+			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime.UnixNano()]; !ok {
 				err := fmt.Errorf("Cannot find value for YMD [%s/%s/%d/%s]", index, field, rowID, 
 						lookupTime.Format("2006-01-02T15"))
 				log.Println(err)
@@ -581,7 +596,7 @@ func (m *BitmapIndex) timeRange(index, field string, rowID uint64, fromTime, toT
 	}
 	if tq == "YMDH" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.Add(time.Hour) {
-			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime]; !ok {
+			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime.UnixNano()]; !ok {
 				err := fmt.Errorf("Cannot find value for YMDH [%s/%s/%d/%s]", index, field, rowID, 
 						lookupTime.Format("2006-01-02T15"))
 				log.Println(err)

@@ -231,6 +231,8 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 	}
 
 	result := roaring.NewBitmap()
+	unions := make([]*roaring.Bitmap, 0)
+	intersects := make([]*roaring.Bitmap, 0)
 	for i, q := range clientQueries {
 		if len(q.Query) == 0 {
 			continue
@@ -257,10 +259,22 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 			if err := bm.UnmarshalBinary(writer.Bytes()); err != nil {
             	return nil, fmt.Errorf("Error unmarshalling query result - %v", err)
 			} else {
-				result = roaring.FastOr(result, bm)
+        		switch q.Query[0].Operation {
+				case pb.QueryFragment_INTERSECT:
+					intersects = append(intersects, bm)
+				case pb.QueryFragment_UNION:
+					unions = append(unions, bm)
+				}
 			}
 		}
 	}
+
+    if len(unions) > 0 {
+		result = roaring.ParOr(0, unions...)
+		intersects = append(intersects, result)
+	}
+	result = roaring.ParAnd(0, intersects...)
+
     return result, nil
 }
 

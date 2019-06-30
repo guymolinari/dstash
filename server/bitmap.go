@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
     "encoding/binary"
+    "encoding/json"
     "fmt"
     "io"
 	"io/ioutil"
@@ -52,9 +53,10 @@ func NewBitmapIndex(endPoint *EndPoint) *BitmapIndex {
 
 func (m *BitmapIndex) Init() error {
 
-    m.fragQueue = make(chan *BitmapFragment, 20000000)
+    //m.fragQueue = make(chan *BitmapFragment, 20000000)
+    m.fragQueue = make(chan *BitmapFragment, 10000000)
     m.bitmapCache = make(map[string]map[string]map[uint64]map[int64]*StandardBitmap)
-    m.workers = 5
+    m.workers = 10
     m.writeSignal = make(chan bool, 1)
     m.setBitThreads = NewCountTrigger(m.writeSignal)
 
@@ -511,6 +513,12 @@ func (m *BitmapIndex) Query(query *pb.BitmapQuery, stream pb.BitmapIndex_QuerySe
 		return fmt.Errorf("query must not be nil")
 	}
 	
+    d, err := json.Marshal(&query)
+    if err != nil {
+        log.Printf("error: %v", err)
+    }
+    log.Printf("vvv query dump:\n%s\n\n", string(d))
+
     if query.Query == nil {
 		return fmt.Errorf("query fragment array must not be nil")
 	}
@@ -520,9 +528,10 @@ func (m *BitmapIndex) Query(query *pb.BitmapQuery, stream pb.BitmapIndex_QuerySe
 	fromTime := time.Unix(0, query.FromTime)
 	toTime := time.Unix(0, query.ToTime)
 
-	prevOp := pb.QueryFragment_INTERSECT
-	firstTime := true
 	result := roaring.NewBitmap()
+	unions := make([]*roaring.Bitmap, 0)
+	intersects := make([]*roaring.Bitmap, 0)
+
 	for _, v := range query.Query {
 		if v.Index == "" {
 			fmt.Errorf("Index not specified for query fragment %#v", v)
@@ -537,19 +546,20 @@ func (m *BitmapIndex) Query(query *pb.BitmapQuery, stream pb.BitmapIndex_QuerySe
 			return err
 		}
 
-		if firstTime  {
-			prevOp = v.Operation
-			result = bm
-			firstTime = false
-			continue
+        switch v.Operation {
+		case pb.QueryFragment_INTERSECT:
+			intersects = append(intersects, bm)
+		case pb.QueryFragment_UNION:
+			unions = append(unions, bm)
 		}
-		if prevOp == pb.QueryFragment_INTERSECT {
-			result = roaring.FastAnd(result, bm)
-		} else {
-			result = roaring.FastOr(result, bm)
-		}
-		prevOp = v.Operation
+
 	}
+
+    if len(unions) > 0 {
+		result = roaring.ParOr(0, unions...)
+		intersects = append(intersects, result)
+	}
+	result = roaring.ParAnd(0, intersects...)
 
 	if buf, err := result.MarshalBinary(); err != nil {
 		return fmt.Errorf("Cannot marshal result roaring bitmap - %v", err)
@@ -584,10 +594,12 @@ func (m *BitmapIndex) timeRange(index, field string, rowID uint64, fromTime, toT
 	if tq == "YMD" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.AddDate(0, 0, 1) {
 			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime.UnixNano()]; !ok {
-				err := fmt.Errorf("Cannot find value for YMD [%s/%s/%d/%s]", index, field, rowID, 
-						lookupTime.Format("2006-01-02T15"))
-				log.Println(err)
-				return nil, err
+				if _, ok := m.bitmapCache[index][field][rowID]; !ok {
+					err := fmt.Errorf("Cannot find value for YMD [%s/%s/%d/%s]", index, field, rowID, 
+							lookupTime.Format("2006-01-02T15"))
+					log.Println(err)
+					return nil, err
+				}
 			} else {
 				a = append(a, bm.Bits)
 			}
@@ -597,10 +609,12 @@ func (m *BitmapIndex) timeRange(index, field string, rowID uint64, fromTime, toT
 	if tq == "YMDH" {
 		for ; lookupTime.Before(toTime); lookupTime = lookupTime.Add(time.Hour) {
 			if bm, ok := m.bitmapCache[index][field][rowID][lookupTime.UnixNano()]; !ok {
-				err := fmt.Errorf("Cannot find value for YMDH [%s/%s/%d/%s]", index, field, rowID, 
-						lookupTime.Format("2006-01-02T15"))
-				log.Println(err)
-				return nil, err
+				if _, ok := m.bitmapCache[index][field][rowID]; !ok {
+					err := fmt.Errorf("Cannot find value for YMDH [%s/%s/%d/%s]", index, field, rowID, 
+							lookupTime.Format("2006-01-02T15"))
+					log.Println(err)
+					return nil, err
+				}
 			} else {
 				a = append(a, bm.Bits)
 			}

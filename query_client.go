@@ -95,7 +95,7 @@ func main() {
 			log.Fatalf("Error during server call to ResultsQuery - %v", err)
 		}
 		elapsed := time.Since(start)
-		for i := 0; i < 10000; i++ {
+		for i := 0; i < 10000 && i < len(results); i++ {
 			fmt.Printf("%d, ", results[i])
 		}
 		log.Println("Done.")

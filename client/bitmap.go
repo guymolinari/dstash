@@ -203,9 +203,6 @@ func (c *BitmapIndex) splitBitmapBatch(batch map[string]map[string]map[uint64]ma
 
 func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 
-    ctx, cancel := context.WithTimeout(context.Background(), Deadline)
-    defer cancel()
-
 	c.Conn.nodeMapLock.RLock()
 	defer c.Conn.nodeMapLock.RUnlock()
 
@@ -230,42 +227,49 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 		}
 	}
 
-	result := roaring.NewBitmap()
-	unions := make([]*roaring.Bitmap, 0)
-	intersects := make([]*roaring.Bitmap, 0)
-	for i, q := range clientQueries {
-		if len(q.Query) == 0 {
-			continue
-		}
-		if stream, err := c.client[i].Query(ctx, q); err != nil {
-            return nil, fmt.Errorf("Error executing query - %v", err)
-		} else {
-			var writer bytes.Buffer
-			for {
-        		packet, err := stream.Recv()
-        		if err == io.EOF {
-            		break
-        		}
-				if err != nil {
-            		return nil, fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err)
-        		}
-				_, err2 := writer.Write(packet.Value)
-				if err2 != nil {
-            		return nil, fmt.Errorf("%v.Query(_) = _, %v", c.client[i], err2)
-        		}
-			}
+    intersectChan := make(chan []*roaring.Bitmap, 100)
+    unionChan := make(chan []*roaring.Bitmap, 100)
 
-			bm := roaring.NewBitmap()
-			if err := bm.UnmarshalBinary(writer.Bytes()); err != nil {
-            	return nil, fmt.Errorf("Error unmarshalling query result - %v", err)
-			} else {
-        		switch q.Query[0].Operation {
-				case pb.QueryFragment_INTERSECT:
-					intersects = append(intersects, bm)
-				case pb.QueryFragment_UNION:
-					unions = append(unions, bm)
-				}
+    done := make(chan error, 100)
+    defer close(done)
+    count := len(c.client)
+
+	result := roaring.NewBitmap()
+    intersects := make([]*roaring.Bitmap, 0)
+    unions := make([]*roaring.Bitmap, 0)
+
+	for i, q := range clientQueries {
+        go func(client pb.BitmapIndexClient, query *pb.BitmapQuery, clientIndex int) {
+            in, un, err := c.query_client(client, query, clientIndex)
+			if in != nil && un != nil {
+				intersectChan <- in
+				unionChan <- un
 			}
+			done <- err
+        }(c.client[i], q, i)
+	}
+
+    for { 
+        err := <- done
+        if err != nil {
+            return nil, err
+        }
+        count--
+        if count == 0 {
+            break
+        }
+    }
+	close(intersectChan)
+	close(unionChan)
+
+	for in := range intersectChan {
+		for _, i := range in {
+			intersects = append(intersects, i)
+		}
+	}
+	for un := range unionChan {
+		for _, u := range un {
+			unions = append(unions, u)
 		}
 	}
 
@@ -276,6 +280,54 @@ func (c *BitmapIndex) query(query *pb.BitmapQuery) (*roaring.Bitmap, error) {
 	result = roaring.ParAnd(0, intersects...)
 
     return result, nil
+}
+
+
+func (c *BitmapIndex) query_client(client pb.BitmapIndexClient, q *pb.BitmapQuery, clientIndex int) (intersects,
+		unions []*roaring.Bitmap, err error) {
+
+	if len(q.Query) == 0 {
+		return nil, nil, nil
+	}
+
+    ctx, cancel := context.WithTimeout(context.Background(), Deadline)
+    defer cancel()
+
+    intersects = make([]*roaring.Bitmap, 0)
+    unions = make([]*roaring.Bitmap, 0)
+
+	if stream, err := client.Query(ctx, q); err != nil {
+        return nil, nil, fmt.Errorf("Error executing query - %v", err)
+	} else {
+		var writer bytes.Buffer
+		for {
+       		packet, err := stream.Recv()
+       		if err == io.EOF {
+           		break
+       		}
+			if err != nil {
+           		return nil, nil, fmt.Errorf("%v.Query(_) = _, %v, node = %s", client, err, 
+					c.Conn.clientConn[clientIndex].Target())
+       		}
+			_, err2 := writer.Write(packet.Value)
+			if err2 != nil {
+            	return nil, nil, fmt.Errorf("%v.Query(_) = _, %v", client, err2)
+        	}
+		}
+
+		bm := roaring.NewBitmap()
+		if err := bm.UnmarshalBinary(writer.Bytes()); err != nil {
+            return nil, nil, fmt.Errorf("Error unmarshalling query result - %v", err)
+		} else {
+        	switch q.Query[0].Operation {
+			case pb.QueryFragment_INTERSECT:
+				intersects = append(intersects, bm)
+			case pb.QueryFragment_UNION:
+				unions = append(unions, bm)
+			}
+		}
+	}
+	return intersects, unions, nil
 }
 
 
